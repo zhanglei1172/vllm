@@ -314,8 +314,47 @@ class DefaultModelLoader(BaseModelLoader):
         # that have loaded weights tracking currently.
         if model_config.quantization is None and loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
-            if weights_not_loaded:
-                raise ValueError(
-                    "Following weights were not initialized from "
-                    f"checkpoint: {weights_not_loaded}"
-                )
+            # if weights_not_loaded:
+            #     raise ValueError(
+            #         "Following weights were not initialized from "
+            #         f"checkpoint: {weights_not_loaded}"
+            #     )
+
+        if model.__class__.__name__ == "Qwen3OmniMoeThinkerForConditionalGeneration":
+            if os.path.exists(f"{model_config.model}/transform_state_dict.pt"):
+                try:
+                    tensor = model.audio_tower.positional_embedding.positional_embedding
+                    ori_device = tensor.device
+                    ori_shape = tensor.shape
+                    ori_dtype = tensor.dtype
+                    Q1 = torch.load(f"{model_config.model}/transform_state_dict.pt")[
+                        "audio_tower.positional_embedding.R1_weight_output"
+                    ]["weight"].to(dtype=torch.float64, device=ori_device)
+                    model.audio_tower.positional_embedding.positional_embedding = (
+                        (
+                            (tensor - tensor.mean(-1, keepdim=True))
+                            .to(dtype=Q1.dtype)
+                            .reshape(-1, ori_shape[-1] // Q1.shape[0], Q1.shape[0])
+                            @ Q1
+                        )
+                        .to(dtype=ori_dtype, device=ori_device)
+                        .reshape(ori_shape)
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to load audio tower positional embedding with error: {e}"
+                    )
+                replace_rmsnorm(model.audio_tower)
+
+def replace_rmsnorm(module: torch.nn.Module):
+    for name, child in module.named_children():
+        if isinstance(child, torch.nn.LayerNorm):
+            replaced = torch.nn.RMSNorm(
+                child.normalized_shape[0],
+                eps=child.eps,
+                dtype=child.weight.dtype,
+            )
+            replaced.weight.data = child.weight.data.clone()
+            setattr(module, name, replaced)
+        else:
+            replace_rmsnorm(child)

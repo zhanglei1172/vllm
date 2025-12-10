@@ -48,12 +48,15 @@ from vllm.config import ModelConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models import SupportsMultiModal
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalDataDict, MultiModalUUIDDict
+from vllm.multimodal.audio import AudioMediaIO
 from vllm.multimodal.utils import MEDIA_CONNECTOR_REGISTRY, MediaConnector
 from vllm.tokenizers import MistralTokenizer, TokenizerLike
 from vllm.transformers_utils.chat_templates import get_chat_template_fallback_path
 from vllm.transformers_utils.processor import cached_get_processor
 from vllm.utils import random_uuid
 from vllm.utils.func_utils import supports_kw
+
+audio_io = AudioMediaIO()
 
 logger = init_logger(__name__)
 
@@ -1338,6 +1341,12 @@ def _parse_chat_message_content_mm_part(
     uuid = part.get("uuid", None)
 
     if isinstance(part_type, str) and part_type in MM_PARSER_MAP and uuid is None:  # noqa: E501
+        if part_type == "audio_url" and isinstance(part["audio_url"]["url"], dict):
+            audio = part["audio_url"]["url"]["array"]
+            sampling_rate = part["audio_url"]["url"].get("sampling_rate", 16000)
+            part["audio_url"]["url"] = (
+                f"data:audio/wav;base64,{audio_io.encode_base64((audio, sampling_rate))}"
+            )
         content = MM_PARSER_MAP[part_type](part)
 
         # Special case for 'image_url.detail'

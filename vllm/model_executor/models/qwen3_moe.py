@@ -499,6 +499,7 @@ class Qwen3MoeModel(nn.Module):
             "_weight_scale",
             ".input_scale",
             "_input_scale",
+            "_zero_point",
         )
 
         params_dict = dict(self.named_parameters())
