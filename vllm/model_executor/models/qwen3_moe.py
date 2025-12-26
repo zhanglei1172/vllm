@@ -29,6 +29,7 @@ from itertools import islice
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from vllm.attention.layer import Attention
@@ -77,7 +78,7 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
-
+USE_FUSED_MOE = True
 
 class Qwen3MoeMLP(nn.Module):
     def __init__(
@@ -208,6 +209,113 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         # return to 1d if input is 1d
         return final_hidden_states.squeeze(0) if is_input_1d else final_hidden_states
+
+
+class Qwen3MoeSparseMoeBlockNonFused(nn.Module):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+    ):
+        super().__init__()
+
+        config = vllm_config.model_config.hf_text_config
+        quant_config = vllm_config.quant_config
+
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.moe_intermediate_size
+        self.norm_topk_prob = config.norm_topk_prob
+        self.use_shared_expert = getattr(config, "use_shared_expert", False)
+
+        # Router (gate)
+        self.gate = ReplicatedLinear(
+            config.hidden_size,
+            config.num_experts,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate",
+        )
+
+        # Create experts
+        self.experts = nn.ModuleList([
+            Qwen3MoeMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                prefix=f"{prefix}.experts.{i}",
+            )
+            for i in range(config.num_experts)
+        ])
+
+        # Shared expert if needed
+        if self.use_shared_expert:
+            self.shared_expert = Qwen3MoeMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                prefix=f"{prefix}.shared_expert",
+            )
+            self.shared_expert_gate = ReplicatedLinear(
+                config.hidden_size,
+                1,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.shared_expert_gate",
+            )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        
+        # router_logits: (batch * sequence_length, n_experts)
+        router_logits, _ = self.gate(hidden_states)
+        
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        
+        if self.norm_topk_prob:
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        
+        # we cast back to the input dtype
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        final_hidden_states = torch.zeros(
+            (sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+        )
+
+        # One hot encode the selected experts to create an expert mask
+        # this will be used to easily index which expert is going to be sollicitated
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+
+        # Loop over all available experts in the model and perform the computation on each expert
+        for expert_idx in range(self.num_experts):
+            expert_layer = self.experts[expert_idx]
+            idx, top_x = torch.where(expert_mask[expert_idx])
+            
+            # Index the correct hidden states and compute the expert hidden state for
+            # the current expert. We need to make sure to multiply the output hidden
+            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+            if len(top_x) > 0:
+                top_x = top_x.to(hidden_states.device)
+                current_state = expert_layer(hidden_states[top_x].reshape(-1, hidden_dim)).to(hidden_states.device)
+                current_hidden_states = current_state * routing_weights[top_x, idx.to(hidden_states.device), None]
+
+                # However `index_add_` only support torch tensors for indexing so we'll use
+                # the `top_x` tensor here.
+                final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+
+        if self.use_shared_expert:
+            shared_expert_output = self.shared_expert(hidden_states)
+            shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
+
+            final_hidden_states = final_hidden_states + shared_expert_output
+
+        final_hidden_states = final_hidden_states.reshape(sequence_length, hidden_dim)
+        return final_hidden_states
 
 
 class Qwen3MoeAttention(nn.Module):
@@ -347,12 +455,19 @@ class Qwen3MoeDecoderLayer(nn.Module):
         mlp_only_layers = (
             [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
         )
+        use_fused_moe = getattr(config, "use_fused_moe", USE_FUSED_MOE)
+        
         if (layer_idx not in mlp_only_layers) and (
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
-            self.mlp = Qwen3MoeSparseMoeBlock(
-                vllm_config=vllm_config, prefix=f"{prefix}.mlp"
-            )
+            if use_fused_moe:
+                self.mlp = Qwen3MoeSparseMoeBlock(
+                    vllm_config=vllm_config, prefix=f"{prefix}.mlp"
+                )
+            else:
+                self.mlp = Qwen3MoeSparseMoeBlockNonFused(
+                    vllm_config=vllm_config, prefix=f"{prefix}.mlp"
+                )
         else:
             self.mlp = Qwen3MoeMLP(
                 hidden_size=config.hidden_size,
@@ -467,15 +582,35 @@ class Qwen3MoeModel(nn.Module):
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        return FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
-            num_redundant_experts=self.num_redundant_experts,
-        )
+        # Check if we're using fused or non-fused MoE
+        use_fused_moe = getattr(self.config, "use_fused_moe", USE_FUSED_MOE)
+        
+        if use_fused_moe:
+            # For fused MoE, use the FusedMoE mapping
+            return FusedMoE.make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=self.config.num_experts,
+                num_redundant_experts=self.num_redundant_experts,
+            )
+        else:
+            # For non-fused MoE, create mapping for individual expert modules
+            expert_mapping = []
+            for expert_id in range(self.config.num_experts):
+                # Each expert has gate_proj, up_proj, and down_proj
+                expert_mapping.append((f"gate_up_proj", "gate_proj", expert_id, 0))
+                expert_mapping.append((f"gate_up_proj", "up_proj", expert_id, 1))
+                expert_mapping.append((f"down_proj", "down_proj", expert_id, 0))
+            
+            # Add shared expert if it exists
+            if getattr(self.config, "use_shared_expert", False):
+                expert_mapping.append(("shared_expert.gate_up_proj.0", "shared_expert_gate_proj", 0, 0))
+                expert_mapping.append(("shared_expert.gate_up_proj.1", "shared_expert_up_proj", 0, 1))
+                expert_mapping.append(("shared_expert.down_proj", "shared_expert_down_proj", 0, 0))
+                expert_mapping.append(("shared_expert_gate", "shared_expert_gate", 0, 0))
+
+            return expert_mapping
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
@@ -574,14 +709,22 @@ class Qwen3MoeModel(nn.Module):
                     weight_loader = typing.cast(
                         Callable[..., bool], param.weight_loader
                     )
-                    success = weight_loader(
-                        param,
-                        loaded_weight,
-                        name_mapped,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                        return_success=True,
-                    )
+                    if not getattr(self.config, "use_fused_moe", USE_FUSED_MOE):
+                        try:
+                            weight_loader(param, loaded_weight, shard_id)
+                            success = True
+                        except Exception:
+                            success = weight_loader(param, loaded_weight)
+                            success = True
+                    else:
+                        success = weight_loader(
+                            param,
+                            loaded_weight,
+                            name_mapped,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                            return_success=True,
+                        )
                     if success:
                         name = name_mapped
                         break

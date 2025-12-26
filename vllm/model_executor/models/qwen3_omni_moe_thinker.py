@@ -345,7 +345,7 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
                 Qwen3OmniMoeAudioEncoderLayer(
                     audio_config,
                     quant_config=quant_config,
-                    prefix=f"{prefix}.layers.{_}.",
+                    prefix=f"{prefix}.layers.{_}",
                 )
                 for _ in range(audio_config.encoder_layers)
             ]

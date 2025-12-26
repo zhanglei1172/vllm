@@ -396,6 +396,49 @@ class CompressedTensorsConfig(QuantizationConfig):
         return is_8_bits and is_token and weight_quant.symmetric and is_dynamic
 
     @staticmethod
+    def _is_static_tensor_w8a8(
+        weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ) -> bool:
+        is_8_bits = weight_quant.num_bits == input_quant.num_bits == 8
+        weight_strategy = (
+            weight_quant.strategy == QuantizationStrategy.TENSOR.value
+            or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+        )
+        is_tensor = (
+            weight_strategy and input_quant.strategy == QuantizationStrategy.TENSOR.value
+        )
+        is_static = not weight_quant.dynamic and not input_quant.dynamic
+
+        # Both symmetric and asymmetric input quantization supported.
+        # Only symmetric weight quantization supported.
+        return is_8_bits and is_tensor and weight_quant.symmetric and is_static
+
+    @staticmethod
+    def _is_static_tensor_w4a8_int(
+        weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ) -> bool:
+        is_weight_4_bits = weight_quant.num_bits == 4
+        is_activation_8_bits = input_quant.num_bits == 8
+        weight_strategy = (
+            weight_quant.strategy == QuantizationStrategy.GROUP.value
+            or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+        )
+        is_tensor = (
+            weight_strategy and input_quant.strategy == QuantizationStrategy.TENSOR.value
+        )
+        is_static = not weight_quant.dynamic and not input_quant.dynamic
+
+        # Both symmetric and asymmetric input quantization supported.
+        # Only symmetric weight quantization supported.
+        return (
+            is_weight_4_bits
+            and is_activation_8_bits
+            and is_tensor
+            and weight_quant.symmetric
+            and is_static
+        )
+
+    @staticmethod
     def _is_dynamic_token_w4a8_int(
         weight_quant: QuantizationArgs, input_quant: QuantizationArgs
     ) -> bool:
@@ -643,6 +686,15 @@ class CompressedTensorsConfig(QuantizationConfig):
                     is_static_input_scheme=False,
                     input_symmetric=input_quant.symmetric,
                 )
+
+            # if self._is_static_tensor_w4a8_int(weight_quant, input_quant):
+            #     return CompressedTensorsW4A8IntStatic(
+            #         num_bits=weight_quant.num_bits,
+            #         strategy=weight_quant.strategy,
+            #         group_size=weight_quant.group_size,
+            #         is_static_input_scheme=True,
+            #         input_symmetric=input_quant.symmetric,
+            #     )
 
             if self._is_dynamic_token_w4a8_int(weight_quant, input_quant):
                 is_static_input_scheme = input_quant and not input_quant.dynamic

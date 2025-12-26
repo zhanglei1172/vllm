@@ -1210,15 +1210,16 @@ class FusedMoE(CustomOp):
             final_shape[shard_dim] = final_shape[shard_dim] // self.tp_size
             param.materialize(final_shape, dtype=loaded_weight.dtype)
 
-        expert_data = param.data if full_load else param.data[expert_id]
-
         # Case input scale: input_scale loading is only supported for fp8
         if "input_scale" in weight_name:
             # this is needed for compressed-tensors only
             loaded_weight = loaded_weight.to(param.data.device)
 
+            # For CompressedTensorsW8A8StaticTensorMoEMethod, each expert has its own input_scale
+            # So we don't need to check if w1 and w3 input_scales are equal
             if (
                 "compressed" in quant_method_name.lower()
+                and "StaticTensor" not in quant_method_name
                 and param.data[expert_id] != 1
                 and (param.data[expert_id] - loaded_weight).abs() > 1e-5
             ):
@@ -1231,9 +1232,11 @@ class FusedMoE(CustomOp):
             self._load_single_value(
                 param=param,
                 loaded_weight=loaded_weight,
-                expert_id=global_expert_id if use_global_sf else expert_id,
+                expert_id=-1 if "StaticTensor" in quant_method_name else (global_expert_id if use_global_sf else expert_id),
             )
             return True if return_success else None
+
+        expert_data = param.data if full_load else param.data[expert_id]
 
         # Case g_idx
         if "g_idx" in weight_name:

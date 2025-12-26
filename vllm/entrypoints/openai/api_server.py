@@ -1388,12 +1388,7 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 async def run_server_worker(
     listen_address, sock, args, client_config=None, **uvicorn_kwargs
 ) -> None:
-    import os
-    if int(os.environ.get('debug', 0)) == 1:
-        import debugpy
-        debugpy.connect(5678)
-        debugpy.wait_for_client()
-        debugpy.breakpoint()
+
     """Run a single API server worker."""
 
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:

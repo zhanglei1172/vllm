@@ -819,6 +819,12 @@ class EngineCoreProc(EngineCore):
         signal.signal(signal.SIGINT, signal_handler)
 
         engine_core: EngineCoreProc | None = None
+        import os
+        if int(os.environ.get('debug', 0)) == 1:
+            import debugpy
+            debugpy.connect(5679)
+            debugpy.wait_for_client()
+            debugpy.breakpoint()
         try:
             parallel_config: ParallelConfig = kwargs["vllm_config"].parallel_config
             if parallel_config.data_parallel_size > 1 or dp_rank > 0:
