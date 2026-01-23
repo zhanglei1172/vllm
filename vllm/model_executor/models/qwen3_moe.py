@@ -23,6 +23,7 @@
 # limitations under the License.
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -78,7 +79,7 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
-USE_FUSED_MOE = True
+USE_FUSED_MOE = os.getenv("VLLM_USE_FUSED_MOE", "0") == "1"
 
 class Qwen3MoeMLP(nn.Module):
     def __init__(
