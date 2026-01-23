@@ -79,7 +79,7 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
-USE_FUSED_MOE = os.getenv("VLLM_USE_FUSED_MOE", "0") == "1"
+USE_FUSED_MOE = os.getenv("VLLM_USE_FUSED_MOE", "1") == "1"
 
 class Qwen3MoeMLP(nn.Module):
     def __init__(
