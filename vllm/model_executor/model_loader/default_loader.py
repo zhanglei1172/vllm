@@ -345,6 +345,7 @@ class DefaultModelLoader(BaseModelLoader):
                         f"Failed to load audio tower positional embedding with error: {e}"
                     )
                 replace_rmsnorm(model.audio_tower)
+                replace_rmsnorm(model.visual)
 
 def replace_rmsnorm(module: torch.nn.Module):
     for name, child in module.named_children():
