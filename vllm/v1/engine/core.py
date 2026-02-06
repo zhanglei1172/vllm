@@ -923,6 +923,12 @@ class EngineCoreProc(EngineCore):
         signal.signal(signal.SIGINT, signal_handler)
 
         engine_core: EngineCoreProc | None = None
+        import os
+        if int(os.environ.get('DEBUG', 0)) == 1:
+            import debugpy
+            debugpy.connect(5679)
+            debugpy.wait_for_client()
+            debugpy.breakpoint()
         try:
             vllm_config: VllmConfig = kwargs["vllm_config"]
             parallel_config: ParallelConfig = vllm_config.parallel_config

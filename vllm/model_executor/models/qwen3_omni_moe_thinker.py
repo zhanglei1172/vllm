@@ -22,6 +22,7 @@
 # limitations under the License.
 """Inference-only Qwen3-Omni-Moe model (thinker part)."""
 
+import os
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from functools import partial
 from typing import Any, Literal, cast
@@ -144,6 +145,20 @@ def _get_feat_extract_output_lengths(input_lengths: torch.Tensor):
         ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
     )
     return output_lengths
+
+
+def replace_rmsnorm(module: torch.nn.Module):
+    for name, child in module.named_children():
+        if isinstance(child, torch.nn.LayerNorm):
+            replaced = torch.nn.RMSNorm(
+                child.normalized_shape[0],
+                eps=child.eps,
+                dtype=child.weight.dtype,
+            )
+            replaced.weight.data = child.weight.data.clone()
+            setattr(module, name, replaced)
+        else:
+            replace_rmsnorm(child)
 
 
 # ============= Audio Encoder Components =============
@@ -324,9 +339,12 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
     def __init__(
         self,
         config: Qwen3OmniMoeAudioEncoderConfig,
+        hf_path: str,
         prefix: str = "",
     ):
         super().__init__()
+
+        self.hf_path = hf_path
 
         embed_dim = config.d_model
         self.num_mel_bins = config.num_mel_bins
@@ -542,6 +560,30 @@ class Qwen3OmniMoeAudioEncoder(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        if len(params_dict) > len(loaded_params):
+            replace_rmsnorm(self)
+            assert len(dict(self.named_parameters(remove_duplicate=False))) == len(
+                loaded_params
+            ), "Parameter count mismatch after replacing RMSNorm."
+            loaded_params = set(params_dict.keys())
+        if os.path.exists(f"{self.hf_path}/transform_state_dict.pt"):
+            tensor = self.positional_embedding.positional_embedding
+            ori_device = tensor.device
+            ori_shape = tensor.shape
+            ori_dtype = tensor.dtype
+            Q1 = torch.load(f"{self.hf_path}/transform_state_dict.pt")[
+                "audio_tower.positional_embedding.R1_weight_output"
+            ]["weight"].to(dtype=torch.float64, device=ori_device)
+            self.positional_embedding.positional_embedding = (
+                (
+                    (tensor - tensor.mean(-1, keepdim=True))
+                    .to(dtype=Q1.dtype)
+                    .reshape(-1, ori_shape[-1] // Q1.shape[0], Q1.shape[0])
+                    @ Q1
+                )
+                .to(dtype=ori_dtype, device=ori_device)
+                .reshape(ori_shape)
+            )
         return loaded_params
 
 
@@ -1031,6 +1073,12 @@ class Qwen3Omni_VisionTransformer(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        if len(params_dict) > len(loaded_params):
+            replace_rmsnorm(self)
+            assert len(dict(self.named_parameters(remove_duplicate=False))) == len(
+                loaded_params
+            ), "Parameter count mismatch after replacing RMSNorm."
+            loaded_params = set(params_dict.keys())
         return loaded_params
 
 
@@ -1648,6 +1696,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         with self._mark_tower_model(vllm_config, "audio"):
             self.audio_tower = Qwen3OmniMoeAudioEncoder(
                 thinker_config.audio_config,
+                hf_path=vllm_config.model_config.hf_config.name_or_path,
                 prefix=maybe_prefix(prefix, "audio_tower"),
             )
 
@@ -1952,7 +2001,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
-            skip_prefixes=["talker.", "code2wav."],
+            skip_prefixes=[
+                "talker.",
+                "code2wav.",
+                "audio_tower.positional_embedding.weight",
+            ],
         )
         loaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
